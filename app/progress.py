@@ -1,9 +1,9 @@
-"""A rate-limited, English-only advanced Telegram progress display.
+"""Rate-safe, detailed, modern Telegram progress display.
 
-Telegram messages cannot be edited for every single frame without hitting flood
-limits. This display records every incoming frame/byte measurement but edits the
-visible message only at a controlled interval, showing exact counters, speed and
-an ETA calculated from those measurements.
+The display deliberately separates *truthful stage telemetry* from the weighted
+end-to-end estimate. Every value shown is sourced from MTProto callbacks,
+FFmpeg progress, FaceFusion tqdm output, or inspected media metadata. Progress
+updates are coalesced by the transport so rendering never waits on Telegram UI.
 """
 
 from __future__ import annotations
@@ -32,8 +32,8 @@ class _Meter:
 
     def update(self, current: int, total: int, unit: str) -> None:
         now = time.monotonic()
-        # A new stage has a different unit or starts its counter again. Reset the
-        # rate window so displayed speed/ETA reflects this stage, not the queue.
+        # A counter reset or unit change means a new stage. Do not let an old
+        # transfer's elapsed time poison current-stage speed/ETA.
         if unit != self.unit or current < self.current:
             self.started_at = now
         self.current = max(0, current)
@@ -63,7 +63,7 @@ class _Meter:
 
 
 class ProgressDisplay:
-    """One editable Telegram message carrying rich job telemetry."""
+    """One editable Telegram message carrying advanced job telemetry."""
 
     def __init__(
         self,
@@ -80,13 +80,30 @@ class ProgressDisplay:
         self.message_id = message_id
         self.edit_interval_seconds = edit_interval_seconds
         self.created_at = time.monotonic()
+
         self.stage = "Waiting"
         self.detail = "Waiting for the worker."
         self.overall: float | None = 0.0
         self.meter = _Meter()
+
         self.video_duration_seconds: float | None = None
+        self.video_width = 0
+        self.video_height = 0
+        self.video_fps = 0.0
+        self.video_frame_count = 0
+        self.video_has_audio: bool | None = None
+        self.input_bytes = 0
         self.quality_line = "Frame-by-frame processing"
+
+        self.asset_name: str | None = None
+        self.asset_percent: float | None = None
+        self.model_cache_bytes: int | None = None
+        self.reported_frame_fps: float | None = None
+        self.memory_limit_bytes: int | None = None
+        self.memory_current_bytes: int | None = None
+        self.cpu_quota_cores: float | None = None
         self.notes: list[str] = []
+
         self._last_edit_at = 0.0
         self._last_text = ""
         self._lock = asyncio.Lock()
@@ -131,9 +148,37 @@ class ProgressDisplay:
             edit_interval_seconds=edit_interval_seconds,
         )
 
-    def set_video_context(self, *, duration_seconds: float, quality_line: str) -> None:
+    def set_video_context(
+        self,
+        *,
+        duration_seconds: float,
+        quality_line: str,
+        width: int = 0,
+        height: int = 0,
+        fps: float = 0.0,
+        frame_count: int = 0,
+        has_audio: bool | None = None,
+        input_bytes: int = 0,
+    ) -> None:
         self.video_duration_seconds = duration_seconds if duration_seconds > 0 else None
+        self.video_width = max(0, width)
+        self.video_height = max(0, height)
+        self.video_fps = max(0.0, fps)
+        self.video_frame_count = max(0, frame_count)
+        self.video_has_audio = has_audio
+        self.input_bytes = max(0, input_bytes)
         self.quality_line = quality_line
+
+    def set_runtime_context(
+        self,
+        *,
+        memory_limit_bytes: int | None,
+        memory_current_bytes: int | None,
+        cpu_quota_cores: float | None,
+    ) -> None:
+        self.memory_limit_bytes = memory_limit_bytes
+        self.memory_current_bytes = memory_current_bytes
+        self.cpu_quota_cores = cpu_quota_cores
 
     async def update(
         self,
@@ -181,6 +226,37 @@ class ProgressDisplay:
 
         return callback
 
+    async def asset_download_update(
+        self,
+        *,
+        asset_name: str | None,
+        current_bytes: int | None,
+        total_bytes: int | None,
+        percent: float | None = None,
+        model_cache_bytes: int | None = None,
+    ) -> None:
+        """Render exact current-model download telemetry when FaceFusion exposes it."""
+        async with self._lock:
+            self.stage = "Downloading model assets"
+            self.detail = (
+                "FaceFusion is obtaining model assets for the selected quality profile."
+            )
+            if asset_name:
+                self.asset_name = asset_name
+            if percent is not None:
+                self.asset_percent = min(100.0, max(0.0, percent))
+            if model_cache_bytes is not None:
+                self.model_cache_bytes = max(0, model_cache_bytes)
+            if (
+                current_bytes is not None
+                and total_bytes is not None
+                and total_bytes > 0
+            ):
+                self.meter.update(current_bytes, total_bytes, "bytes")
+            if self.overall is None or self.overall < 25:
+                self.overall = 25.0
+            await self._render_if_due(force=False)
+
     async def frame_update(
         self,
         *,
@@ -190,6 +266,8 @@ class ProgressDisplay:
         detail: str = "Swapping every frame with FaceFusion.",
     ) -> None:
         fraction = current / total if total > 0 else 0.0
+        if fps and fps > 0:
+            self.reported_frame_fps = fps
         note = f"Inference speed: {fps:.2f} frames/s" if fps and fps > 0 else None
         await self.update(
             stage="Frame-by-frame face swap",
@@ -244,8 +322,6 @@ class ProgressDisplay:
                 # await a Telegram network RPC from the FaceFusion log reader.
                 queue_edit(self.chat_id, self.message_id, text)
             else:
-                # Small fake transports used by unit tests keep the simple async
-                # path, while production always uses the coalescing queue above.
                 await self.telegram.edit_message(
                     self.chat_id,
                     self.message_id,
@@ -253,8 +329,6 @@ class ProgressDisplay:
                     noncritical=True,
                 )
         except Exception:  # noqa: BLE001 - progress must never stop inference
-            # Progress must never stop inference. The transport handles its own
-            # token-safe diagnostics; Telegram may also reject a no-op edit.
             self._last_edit_at = now
             return
         self._last_edit_at = now
@@ -262,69 +336,182 @@ class ProgressDisplay:
 
     def render(self) -> str:
         elapsed = max(0.0, time.monotonic() - self.created_at)
+        stage_fraction = self.meter.fraction
+        stage_eta = self.meter.eta_seconds
         lines = [
-            "FACE SWAP JOB",
-            f"Job: {self.job_id[:12]}",
-            f"Stage: {self.stage}",
-            f"Activity: {self.detail}",
-            "",
+            "╭─ FACE SWAP ENGINE ──────────────────",
+            f"│ Job       {self.job_id[:12]}",
+            f"│ State     {self.stage}",
+            f"│ Activity  {self._trim(self.detail, 72)}",
+            "├─ PIPELINE ───────────────────────────",
+            f"│ {self._pipeline_line()}",
+            "├─ PROGRESS ───────────────────────────",
         ]
         if self.overall is not None:
-            lines.append(f"Overall: {self._bar(self.overall)} {self.overall:5.1f}%")
-        fraction = self.meter.fraction
-        if fraction is not None:
-            if self.meter.unit == "bytes":
-                lines.append(
-                    "Transfer: "
-                    f"{self._bytes(self.meter.current)} / {self._bytes(self.meter.total)} "
-                    f"({fraction * 100:5.1f}%)"
-                )
-            elif self.meter.unit == "frames":
-                lines.append(
-                    f"Frames: {self.meter.current:,} / {self.meter.total:,} ({fraction * 100:5.1f}%)"
-                )
-                if self.video_duration_seconds and self.meter.total:
-                    timeline = self.video_duration_seconds * fraction
-                    lines.append(
-                        f"Timeline: {self._duration(timeline)} / {self._duration(self.video_duration_seconds)}"
-                    )
-            elif self.meter.unit == "milliseconds":
-                lines.append(
-                    f"Media time: {self._duration(self.meter.current / 1000)} / "
-                    f"{self._duration(self.meter.total / 1000)}"
-                )
-        speed = self.meter.speed
-        if speed:
-            if self.meter.unit == "bytes":
-                lines.append(f"Transfer speed: {self._bytes(speed)}/s")
-            elif self.meter.unit == "frames":
-                lines.append(f"Processing speed: {speed:.2f} frames/s")
-        eta = self.meter.eta_seconds
-        lines.append(
-            f"Estimated stage remaining: {self._duration(eta) if eta is not None else 'Calculating…'}"
-        )
-        lines.append(f"Elapsed: {self._duration(elapsed)}")
-        lines.append(f"Quality: {self.quality_line}")
+            lines.append(
+                f"│ Overall   {self._bar(self.overall, cells=18)} {self.overall:5.1f}%"
+            )
+        if stage_fraction is not None:
+            lines.append(
+                f"│ Stage     {self._bar(stage_fraction * 100, cells=18)} {stage_fraction * 100:5.1f}%"
+            )
+        else:
+            lines.append("│ Stage     Live telemetry pending")
+
+        lines.extend(self._meter_lines(stage_fraction))
+        lines.extend(self._video_lines())
+
+        lines.append("├─ RUNTIME ────────────────────────────")
+        if self.memory_limit_bytes is not None:
+            current = (
+                f" · {self._bytes(self.memory_current_bytes)} used"
+                if self.memory_current_bytes is not None
+                else ""
+            )
+            lines.append(
+                f"│ Memory    {self._bytes(self.memory_limit_bytes)} limit{current}"
+            )
+        if self.cpu_quota_cores is not None:
+            lines.append(f"│ CPU quota {self.cpu_quota_cores:.2f} vCPU")
+        if stage_eta is not None:
+            lines.append(f"│ Stage ETA {self._duration(stage_eta)}")
+        else:
+            lines.append("│ Stage ETA Calculating…")
+        lines.append(f"│ Elapsed   {self._duration(elapsed)}")
+        lines.append(f"│ Quality   {self._trim(self.quality_line, 66)}")
         if self.notes:
-            lines.append("Telemetry: " + " • ".join(self.notes[-2:]))
-        lines.append("Use My Status or Cancel Render at any time.")
+            lines.append(f"│ Telemetry {self._trim(' • '.join(self.notes[-2:]), 66)}")
+        lines.append("╰─ Use My Status or Cancel Render")
         return "\n".join(lines)
 
+    def _meter_lines(self, stage_fraction: float | None) -> list[str]:
+        lines: list[str] = []
+        if self.meter.unit == "bytes" and stage_fraction is not None:
+            label = self._byte_label()
+            lines.append(
+                f"│ {label:<9}{self._bytes(self.meter.current)} / {self._bytes(self.meter.total)} "
+                f"({stage_fraction * 100:5.1f}%)"
+            )
+            speed = self.meter.speed
+            if speed:
+                lines.append(f"│ Speed     {self._bytes(speed)}/s")
+            if self._is_asset_stage() and self.asset_name:
+                lines.append(f"│ Asset     {self._trim(self.asset_name, 66)}")
+            if self._is_asset_stage() and self.model_cache_bytes is not None:
+                lines.append(
+                    f"│ Cache     {self._bytes(self.model_cache_bytes)} available locally"
+                )
+        elif self.meter.unit == "frames" and stage_fraction is not None:
+            lines.append(
+                f"│ Frames    {self.meter.current:,} / {self.meter.total:,} ({stage_fraction * 100:5.1f}%)"
+            )
+            if self.video_duration_seconds and self.meter.total:
+                timeline = self.video_duration_seconds * stage_fraction
+                lines.append(
+                    f"│ Timeline  {self._duration(timeline)} / {self._duration(self.video_duration_seconds)}"
+                )
+            speed = self.reported_frame_fps or self.meter.speed
+            if speed:
+                lines.append(f"│ Inference {speed:.2f} frames/s")
+        elif self.meter.unit == "milliseconds" and stage_fraction is not None:
+            lines.append(
+                f"│ Media     {self._duration(self.meter.current / 1000)} / "
+                f"{self._duration(self.meter.total / 1000)}"
+            )
+        elif self._is_asset_stage() and self.asset_name:
+            percent = (
+                f" ({self.asset_percent:.1f}%)"
+                if self.asset_percent is not None
+                else ""
+            )
+            lines.append(f"│ Asset     {self._trim(self.asset_name, 66)}{percent}")
+        return lines
+
+    def _video_lines(self) -> list[str]:
+        if not self.video_width or not self.video_height:
+            return []
+        audio = "audio" if self.video_has_audio else "no audio"
+        fps = f"{self.video_fps:.3g} fps" if self.video_fps else "unknown fps"
+        frames = (
+            f" · {self.video_frame_count:,} frames" if self.video_frame_count else ""
+        )
+        lines = [
+            "├─ SOURCE VIDEO ───────────────────────",
+            f"│ Video     {self.video_width}×{self.video_height} · {fps}{frames} · {audio}",
+        ]
+        if self.input_bytes:
+            lines.append(f"│ Input     {self._bytes(self.input_bytes)}")
+        return lines
+
+    def _pipeline_line(self) -> str:
+        phases = ("Input", "Assets", "Frames", "Finalize", "Deliver")
+        active = self._pipeline_index()
+        tokens = []
+        for index, phase in enumerate(phases):
+            if self.stage == "Completed" or index < active:
+                marker = "✓"
+            elif index == active:
+                marker = "●"
+            else:
+                marker = "○"
+            tokens.append(f"{marker} {phase}")
+        return " › ".join(tokens)
+
+    def _pipeline_index(self) -> int:
+        stage = self.stage.lower()
+        if (
+            "inspecting" in stage
+            or "preparing job" in stage
+            or "queued" in stage
+            or ("download" in stage and ("source" in stage or "target" in stage))
+        ):
+            return 0
+        if any(value in stage for value in ("model", "initializing")):
+            return 1
+        if any(value in stage for value in ("frame", "preparing frames")):
+            return 2
+        if any(
+            value in stage
+            for value in (
+                "assembling",
+                "restoring",
+                "labelling",
+                "finalizing",
+                "splitting",
+            )
+        ):
+            return 3
+        if "upload" in stage:
+            return 4
+        if self.stage in {"Stopped", "Waiting"}:
+            return 0
+        return 1
+
+    def _is_asset_stage(self) -> bool:
+        return self._pipeline_index() == 1
+
+    def _byte_label(self) -> str:
+        stage = self.stage.lower()
+        if self._is_asset_stage():
+            return "Asset"
+        if "upload" in stage:
+            return "Upload"
+        return "Transfer"
+
     @staticmethod
-    def _bar(percent: float) -> str:
-        cells = 12
+    def _bar(percent: float, *, cells: int) -> str:
         full = min(cells, max(0, math.floor(percent / 100 * cells)))
         return "[" + "█" * full + "░" * (cells - full) + "]"
 
     @staticmethod
     def _bytes(value: float) -> str:
-        value = float(value)
+        amount = float(value)
         units = ("B", "KiB", "MiB", "GiB", "TiB")
         index = 0
-        while value >= 1024 and index < len(units) - 1:
-            value /= 1024
+        while amount >= 1024 and index < len(units) - 1:
+            amount /= 1024
             index += 1
-        return f"{value:.2f} {units[index]}"
+        return f"{amount:.2f} {units[index]}"
 
     @staticmethod
     def _duration(value: float | None) -> str:
@@ -336,3 +523,7 @@ class ProgressDisplay:
         if hours:
             return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
         return f"{minutes:02d}:{seconds:02d}"
+
+    @staticmethod
+    def _trim(value: str, limit: int) -> str:
+        return value if len(value) <= limit else value[: max(1, limit - 1)] + "…"

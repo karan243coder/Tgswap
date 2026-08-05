@@ -38,6 +38,11 @@ from .menus import (
 )
 from .models import Job, MediaRef
 from .progress import ProgressDisplay
+from .resources import (
+    RenderResourceError,
+    inspect_runtime_resources,
+    require_render_memory,
+)
 from .storage import Storage
 from .telegram_mtproto import MTProtoTelegramClient, TelegramTransportError
 from .worker import JobWorker
@@ -710,6 +715,14 @@ class BotService:
                 chat_id,
                 intro="A source image is required before a target video can be rendered.",
             )
+            return
+        try:
+            require_render_memory(
+                inspect_runtime_resources(),
+                self.settings.min_render_memory_mb,
+            )
+        except RenderResourceError as exc:
+            await self._send_control_panel(chat_id, intro=str(exc))
             return
         if (
             self.settings.max_jobs_per_user > 0

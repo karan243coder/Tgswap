@@ -121,6 +121,7 @@ class Settings:
     queue_max_size: int
     job_timeout_seconds: int
     workspace_headroom_mb: int
+    min_render_memory_mb: int
     source_retention_hours: int
     cleanup_interval_minutes: int
     keep_job_artifacts: bool
@@ -207,7 +208,7 @@ class Settings:
         if workflow_strategy not in _ALLOWED_WORKFLOW_STRATEGIES:
             raise ConfigError("WORKFLOW_STRATEGY must be memory or disk")
 
-        watermark_text = os.getenv("WATERMARK_TEXT", "bimbo").strip()
+        watermark_text = os.getenv("WATERMARK_TEXT", "AI face swap").strip()
         if len(watermark_text) > 80:
             raise ConfigError("WATERMARK_TEXT must be at most 80 characters")
 
@@ -245,6 +246,11 @@ class Settings:
             ),
             workspace_headroom_mb=_env_int(
                 "WORKSPACE_HEADROOM_MB", 1024, minimum=128, maximum=1_000_000
+            ),
+            # The high-quality FaceFusion profile is not safe on tiny 512 MiB
+            # containers. Set 0 only when an operator knowingly manages memory.
+            min_render_memory_mb=_env_int(
+                "MIN_RENDER_MEMORY_MB", 3072, minimum=0, maximum=1_000_000
             ),
             source_retention_hours=_env_int(
                 "SOURCE_RETENTION_HOURS", 24, minimum=1, maximum=720

@@ -24,6 +24,11 @@ from .media import (
 )
 from .models import ActiveJob, Job
 from .progress import ProgressDisplay
+from .resources import (
+    RenderResourceError,
+    inspect_runtime_resources,
+    require_render_memory,
+)
 from .storage import Storage
 from .telegram_mtproto import MTProtoTelegramClient, TelegramTransportError
 
@@ -34,6 +39,17 @@ _TQDM_RE = re.compile(
     r"(?:.*?(?P<fps>[\d.]+)\s*frame/s)?",
     re.IGNORECASE,
 )
+_SIZE_TEXT_RE = r"\d+(?:\.\d+)?\s*(?:[KMGT]i?B|[KMGT]|B)"
+_DOWNLOAD_SIZE_RE = re.compile(
+    rf"(?P<current>{_SIZE_TEXT_RE})\s*/\s*(?P<total>{_SIZE_TEXT_RE})",
+    re.IGNORECASE,
+)
+_DOWNLOAD_PERCENT_RE = re.compile(r"(?P<percent>\d{1,3})%\|", re.IGNORECASE)
+_MODEL_FILE_RE = re.compile(
+    r"(?:file_name|file name|filename)\s*=\s*(?P<name>[^,\]\s]+)",
+    re.IGNORECASE,
+)
+_ONNX_FILE_RE = re.compile(r"(?P<name>[A-Za-z0-9_.-]+\.onnx)", re.IGNORECASE)
 
 
 class JobCancelled(RuntimeError):
@@ -76,6 +92,7 @@ class JobWorker:
         self._stopping = False
         self._active: ActiveJob | None = None
         self._cancel_requested: set[str] = set()
+        self._last_model_cache_scan_at = 0.0
 
     @property
     def active_job_id(self) -> str | None:
@@ -159,6 +176,13 @@ class JobWorker:
         normalized_target = job_dir / "target-normalized.mp4"
 
         try:
+            resources = inspect_runtime_resources()
+            progress.set_runtime_context(
+                memory_limit_bytes=resources.memory_limit_bytes,
+                memory_current_bytes=resources.memory_current_bytes,
+                cpu_quota_cores=resources.cpu_quota_cores,
+            )
+            require_render_memory(resources, self.settings.min_render_memory_mb)
             await progress.update(
                 stage="Starting render",
                 detail="Verifying the isolated media workspace and render profile.",
@@ -176,6 +200,12 @@ class JobWorker:
                 quality_line=self._quality_line(
                     input_info.width, input_info.height, input_info.fps
                 ),
+                width=input_info.width,
+                height=input_info.height,
+                fps=input_info.fps,
+                frame_count=input_info.frame_count,
+                has_audio=input_info.has_audio,
+                input_bytes=job.target_path.stat().st_size,
             )
 
             target_for_facefusion = job.target_path
@@ -281,6 +311,9 @@ class JobWorker:
             await progress.fail(
                 "Processing exceeded the configured timeout and was stopped."
             )
+        except RenderResourceError as exc:
+            self.storage.set_job_status(job.job_id, "failed", error=str(exc)[:500])
+            await progress.fail(str(exc))
         except MediaError as exc:
             self.storage.set_job_status(job.job_id, "failed", error=str(exc)[:500])
             await progress.fail(f"Media processing stopped: {exc}")
@@ -532,12 +565,16 @@ class JobWorker:
                 )
             return
 
-        if "downloading" in lowered and ("model" in lowered or ".onnx" in lowered):
-            await progress.update(
-                stage="Downloading model assets",
-                detail="FaceFusion is obtaining required model assets for the selected quality profile.",
-                overall=25,
-                note="This normally happens only on the first render after deployment.",
+        if "downloading" in lowered:
+            asset_name, current_bytes, total_bytes, percent = (
+                self._parse_asset_download(clean)
+            )
+            await progress.asset_download_update(
+                asset_name=asset_name,
+                current_bytes=current_bytes,
+                total_bytes=total_bytes,
+                percent=percent,
+                model_cache_bytes=self._model_cache_bytes(),
             )
             return
         if "extracting frames" in lowered:
@@ -569,6 +606,77 @@ class JobWorker:
             fps = self._float_or_none(match.group("fps"))
             if total > 0:
                 await progress.frame_update(current=current, total=total, fps=fps)
+
+    def _parse_asset_download(
+        self,
+        line: str,
+    ) -> tuple[str | None, int | None, int | None, float | None]:
+        """Parse FaceFusion/tqdm model-download output without inventing data."""
+        file_match = _MODEL_FILE_RE.search(line) or _ONNX_FILE_RE.search(line)
+        asset_name = file_match.group("name") if file_match else None
+
+        size_match = _DOWNLOAD_SIZE_RE.search(line)
+        current_bytes: int | None = None
+        total_bytes: int | None = None
+        if size_match:
+            current_bytes = self._human_size_to_bytes(size_match.group("current"))
+            total_bytes = self._human_size_to_bytes(size_match.group("total"))
+
+        percent_match = _DOWNLOAD_PERCENT_RE.search(line)
+        percent = (
+            self._float_or_none(percent_match.group("percent"))
+            if percent_match
+            else None
+        )
+        return asset_name, current_bytes, total_bytes, percent
+
+    def _model_cache_bytes(self) -> int | None:
+        """Return a throttled snapshot of downloaded FaceFusion model assets."""
+        now = time.monotonic()
+        if now - self._last_model_cache_scan_at < 2.5:
+            return None
+        self._last_model_cache_scan_at = now
+        models_root = (
+            Path(self.settings.facefusion_entrypoint).parent / ".assets" / "models"
+        )
+        try:
+            return sum(
+                path.stat().st_size for path in models_root.rglob("*") if path.is_file()
+            )
+        except OSError:
+            return None
+
+    @staticmethod
+    def _human_size_to_bytes(value: str) -> int | None:
+        match = re.fullmatch(
+            r"\s*(?P<number>\d+(?:\.\d+)?)\s*(?P<unit>[KMGT]?i?B|[KMGT])\s*",
+            value,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        try:
+            number = float(match.group("number"))
+        except ValueError:
+            return None
+        unit = match.group("unit").upper()
+        factors = {
+            "B": 1,
+            "K": 1024,
+            "KB": 1024,
+            "KIB": 1024,
+            "M": 1024**2,
+            "MB": 1024**2,
+            "MIB": 1024**2,
+            "G": 1024**3,
+            "GB": 1024**3,
+            "GIB": 1024**3,
+            "T": 1024**4,
+            "TB": 1024**4,
+            "TIB": 1024**4,
+        }
+        factor = factors.get(unit)
+        return int(number * factor) if factor else None
 
     @staticmethod
     def _ffmpeg_progress_seconds(line: str) -> float | None:
@@ -792,6 +900,18 @@ class JobWorker:
 
     def _friendly_process_error(self, error: ExternalProcessError) -> str:
         tail = error.log_tail.lower()
+        if error.return_code == -9:
+            resources = inspect_runtime_resources()
+            limit = (
+                f"{resources.memory_limit_mib:.0f} MiB"
+                if resources.memory_limit_mib is not None
+                else "an unknown memory limit"
+            )
+            return (
+                "FaceFusion was killed by Linux (SIGKILL), most likely because the container ran out of RAM. "
+                f"This instance reports {limit}. The current high-quality profile needs at least "
+                f"{self.settings.min_render_memory_mb} MiB. Upgrade the Koyeb instance; this is not a source-image error."
+            )
         if "no source face" in tail or "choose image source" in tail:
             return "No clear face was found in the source image. Send a well-lit, front-facing image with one face."
         if "no target face" in tail or "choose image or video target" in tail:
