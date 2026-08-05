@@ -117,22 +117,29 @@ limits. The values shown are based on real callbacks/log output, not fake timer
 percentages:
 
 ```text
-FACE SWAP JOB
-Job: 91a0e34b5f20
-Stage: Frame-by-frame face swap
-Activity: Swapping every frame with FaceFusion.
-
-Overall: [████████░░░░] 67.5%
-Frames: 3,240 / 4,800 (67.5%)
-Timeline: 01:21 / 02:00
-Processing speed: 6.42 frames/s
-Estimated stage remaining: 04:03
-Elapsed: 08:11
-Quality: 1920×1080 • 30 fps • reference tracking • pixel boost 512x512
-Telemetry: Inference speed: 6.42 frames/s
-Use My Status or Cancel Render at any time.
+╭─ FACE SWAP ENGINE ──────────────────
+│ Job       91a0e34b5f20
+│ State     Frame-by-frame face swap
+│ Activity  Swapping every frame with FaceFusion.
+├─ PIPELINE ───────────────────────────
+│ ✓ Input › ✓ Assets › ● Frames › ○ Finalize › ○ Deliver
+├─ PROGRESS ───────────────────────────
+│ Overall   [████████████░░░░░░]  67.5%
+│ Stage     [████████████░░░░░░]  67.5%
+│ Frames    3,240 / 4,800 ( 67.5%)
+│ Timeline  01:21 / 02:00
+│ Inference 6.42 frames/s
+├─ SOURCE VIDEO ───────────────────────
+│ Video     1920×1080 · 30 fps · 4,800 frames · audio
+├─ RUNTIME ────────────────────────────
+│ Stage ETA 04:03
+│ Elapsed   08:11
+╰─ Use My Status or Cancel Render
 ```
 
+During the first model warm-up it also reports the **current model filename**,
+actual downloaded bytes, current-asset percentage, transfer speed, cache size,
+and stage ETA whenever FaceFusion exposes those values in its download output.
 The display also reports MTProto download/upload bytes, FFmpeg preparation,
 model-asset download, output labelling, part splitting, and delivery stages.
 
@@ -223,6 +230,44 @@ sequence, but a large render still needs room for the uploaded video, output,
 optional label pass, temporary files, model cache, and one output part while it
 is uploaded. A practical baseline is at least **three times the largest target
 video plus 10 GB**; use more for long 4K videos.
+
+### Do not use the 512 MiB Koyeb instance for FaceFusion rendering
+
+The 512 MiB Koyeb Free/Micro-style instance can keep the Telegram control bot
+alive, but it cannot safely load the current FaceFusion video profile. The
+`hyperswap_1a_256.onnx` asset alone is about 384 MiB on disk; ONNX Runtime,
+face detection/landmark models, Python, FFmpeg buffers, and video frames need
+substantial additional RAM. Linux therefore kills the renderer with signal
+`-9` (SIGKILL/OOM), exactly as a container memory limit is reached.
+
+The bot now detects the cgroup memory limit **before model load** and reports a
+clear resource message instead of incorrectly blaming the source image.
+
+| Koyeb instance | RAM / CPU | Result |
+| --- | --- | --- |
+| Free / 512 MiB | 512 MiB / 0.1 vCPU | Bot UI only; FaceFusion video rendering is not viable. |
+| Standard Medium / Eco Medium | 2 GiB | Low-memory testing only; reduce profile settings below. |
+| Standard Large / Eco Large | 4 GiB | Recommended minimum for the current high-quality CPU profile. |
+| GPU instance | GPU + large RAM | Recommended for frequent or long video renders. |
+
+For the current high-quality profile, set:
+
+```dotenv
+MIN_RENDER_MEMORY_MB=3072
+```
+
+For a **2 GiB test-only** profile, lower quality deliberately:
+
+```dotenv
+MIN_RENDER_MEMORY_MB=2048
+EXECUTION_THREADS=1
+FACE_SWAPPER_PIXEL_BOOST=256x256
+FACE_MASK_TYPES=box
+OUTPUT_VIDEO_QUALITY=85
+```
+
+This lower profile still does not make 512 MiB viable. The worker is already
+single-concurrency: only one FaceFusion video subprocess runs at a time.
 
 ### CPU versus GPU
 

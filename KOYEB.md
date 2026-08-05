@@ -43,7 +43,43 @@ Why one instance? This deployment deliberately has one FaceFusion worker and a
 SQLite queue under `/data`. Multiple instances can receive different MTProto
 updates and would need Redis/shared queue coordination.
 
-## 3. Attach persistent storage
+## 3. Choose a render-capable instance
+
+Do **not** use the 512 MiB / 0.1 vCPU Free instance for FaceFusion video
+rendering. It can run the Telegram UI but cannot hold the FaceFusion model,
+ONNX Runtime, detector models and video frame buffers together. A Linux
+`SIGKILL` / return code `-9` after model download is an out-of-memory kill, not
+a source-image error.
+
+Use one of these choices:
+
+| Intended use | Recommended Koyeb instance |
+| --- | --- |
+| Current high-quality CPU profile | **Large (4 GiB RAM / 4 vCPU)** or Eco Large (4 GiB / 2 vCPU) |
+| Low-quality short-video testing | Medium (2 GiB / 2 vCPU) with the low-memory settings below |
+| Regular/long video rendering | Compatible GPU instance |
+
+For the high-quality profile, add:
+
+```dotenv
+MIN_RENDER_MEMORY_MB=3072
+```
+
+For a 2 GiB test-only profile, use:
+
+```dotenv
+MIN_RENDER_MEMORY_MB=2048
+EXECUTION_THREADS=1
+FACE_SWAPPER_PIXEL_BOOST=256x256
+FACE_MASK_TYPES=box
+OUTPUT_VIDEO_QUALITY=85
+```
+
+The bot has exactly one FaceFusion worker, so only one video is rendered at a
+time. Lowering worker concurrency cannot make a 512 MiB container hold the
+required models.
+
+## 4. Attach persistent storage
 
 Attach a Koyeb volume at exactly:
 
@@ -68,7 +104,7 @@ The volume stores:
 Do not mount a volume over `/app` or `/facefusion`. The Docker entrypoint fixes
 `/data` ownership and drops to an unprivileged runtime account before serving.
 
-## 4. Add Koyeb environment variables
+## 5. Add Koyeb environment variables
 
 Set at minimum:
 
@@ -88,6 +124,7 @@ MAX_VIDEO_SIDE=0
 QUEUE_MAX_SIZE=0
 JOB_TIMEOUT_SECONDS=0
 WORKSPACE_HEADROOM_MB=1024
+MIN_RENDER_MEMORY_MB=3072
 TELEGRAM_UPLOAD_PART_MB=1900
 SPLIT_LARGE_RESULTS=true
 WORKFLOW_STRATEGY=memory
@@ -110,7 +147,7 @@ For a private owner-only bot, add:
 ALLOWED_USER_IDS=123456789
 ```
 
-## 5. Configure the health check
+## 6. Configure the health check
 
 In Koyeb Service Settings configure an HTTP health check:
 
@@ -127,7 +164,7 @@ In Koyeb Service Settings configure an HTTP health check:
 does not wait for model downloads or MTProto reconnects. Use `/readyz` only for
 manual diagnostics; it becomes `200` when Telegram is connected.
 
-## 6. Verify
+## 7. Verify
 
 After deployment:
 
@@ -158,7 +195,7 @@ Then open Telegram and test the button-first control panel:
 The bot should create an editable progress message before the large target video
 is downloaded.
 
-## 7. GPU deployment
+## 8. GPU deployment
 
 CPU works but is not suitable for frequent large/high-resolution renders. For a
 compatible NVIDIA GPU deployment, build using the official CUDA FaceFusion base:
