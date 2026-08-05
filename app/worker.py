@@ -406,9 +406,18 @@ class JobWorker:
                 f"\n\n--- {stage} @ {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ---\n".encode()
             )
             log_handle.flush()
+            # FaceFusion discovers processor modules using project-relative
+            # paths. The Docker service itself runs from /app, so headless
+            # FaceFusion must be launched from its own repository root.
+            working_directory = (
+                str(Path(self.settings.facefusion_entrypoint).parent)
+                if mode == "facefusion"
+                else None
+            )
             try:
                 process = await asyncio.create_subprocess_exec(
                     *command,
+                    cwd=working_directory,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True,
