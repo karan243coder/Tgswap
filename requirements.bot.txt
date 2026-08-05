@@ -1,0 +1,8 @@
+# The FaceFusion runtime itself is supplied by the pinned official base image.
+# Telethon uses the operator's Telegram API ID/hash + bot token to avoid the
+# public HTTP Bot API's small file-transfer limits and to expose byte progress.
+fastapi==0.115.12
+uvicorn[standard]==0.34.0
+telethon==1.44.0
+# Optional native acceleration used automatically by Telethon for large transfers.
+cryptg==0.5.0.post0
