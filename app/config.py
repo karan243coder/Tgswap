@@ -207,7 +207,7 @@ class Settings:
         if workflow_strategy not in _ALLOWED_WORKFLOW_STRATEGIES:
             raise ConfigError("WORKFLOW_STRATEGY must be memory or disk")
 
-        watermark_text = os.getenv("WATERMARK_TEXT", "AI face swap").strip()
+        watermark_text = os.getenv("WATERMARK_TEXT", "bimbo").strip()
         if len(watermark_text) > 80:
             raise ConfigError("WATERMARK_TEXT must be at most 80 characters")
 
